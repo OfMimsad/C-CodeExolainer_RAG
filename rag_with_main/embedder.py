@@ -48,7 +48,7 @@ def load_cpp_files(folder_path):
     return files
 
 # === Chunk code ===
-def chunk_code(files, tokenizer, max_tokens=256, stride=128):
+def chunk_code(files, tokenizer, max_tokens=200, stride=100):
     chunks = []
     total_chunks = 0
     print("📦 Chunking code files...")
@@ -87,7 +87,7 @@ def embed_chunks(chunks, model, tokenizer, batch_size=32):
         texts = [chunk["chunk"] for chunk in batch]
 
         try:
-            encoded_input = tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(device)
+            encoded_input = tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt").to(device)
             with torch.no_grad():
                 model_output = model(**encoded_input)
 
@@ -99,7 +99,7 @@ def embed_chunks(chunks, model, tokenizer, batch_size=32):
         except Exception as e:
             print(f"❌ Error embedding batch {i}-{i+batch_size}: {e}")
 
-    all_embeddings = np.vstack(embeddings)
+    all_embeddings = np.vstack(embeddings) if embeddings else np.array([])
     print(f"\n✅ Total embedded chunks: {len(metadata)}\n")
     return all_embeddings, metadata
 

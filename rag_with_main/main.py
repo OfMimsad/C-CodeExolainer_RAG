@@ -17,16 +17,21 @@ from code_loader import load_cpp_files, chunk_code
 from embedder import embed_chunks, save_faiss_index, load_faiss_index, load_metadata, get_embedding_model
 from rag_query import search_index
 from logger import setup_logger
+from code_analyzer import build_symbol_table, load_symbol_table, query_symbol_table
 
 # === Config ===
 INDEX_FILE = "code_index.faiss"
 META_FILE = "code_meta.json"
 MEMORY_FILE = "chat_memory.json"
+SYMBOL_FILE = "symbol_table.json"
 MAX_HISTORY = 5
 MODEL_PATH = "models/mistral-7B-Instruct-v0.3/mistral.gguf"
 
 setup_logger()
 console = Console()
+
+# === Global chat history ===
+chat_history = []
 
 # === Hardware-aware model initialization ===
 def get_safe_gpu_layers():
@@ -86,27 +91,60 @@ def explain_with_mistral(prompt):
 def build_index(codebase_path):
     console.print("[bold magenta]🔧 Starting index build...[/bold magenta]")
     files = load_cpp_files(codebase_path)
+    if not files:
+        console.print("[bold red]❌ No valid C++ files found in the codebase.[/bold red]")
+        return False
     model, tokenizer = get_embedding_model()
-    chunks = chunk_code(files, tokenizer, max_tokens=256)
-    embeddings = embed_chunks(chunks, model, tokenizer)
-    save_faiss_index(embeddings, chunks)
-    console.print("[bold green]✅ Indexing complete.[/bold green]")
-
+    chunks = chunk_code(files, tokenizer, max_tokens=200, stride=100)
+    if not chunks:
+        console.print("[bold red]❌ No chunks generated. Cannot create FAISS index.[/bold red]")
+        return False
+    embedding_matrix, metadata = embed_chunks(chunks, model, tokenizer)
+    save_faiss_index(embedding_matrix, metadata)
+    console.print("[bold green]✅ FAISS indexing complete.[/bold green]")
+    
+    # Build symbol table
+    console.print("[bold magenta]🔍 Building symbol table...[/bold magenta]")
+    build_symbol_table(codebase_path)
+    console.print("[bold green]✅ Symbol table built.[/bold green]")
+    return True
 
 # === Querying ===
 def query_index(user_query):
     try:
         index = load_faiss_index()
         metadata = load_metadata()
+        symbol_table = load_symbol_table()
     except Exception as e:
-        console.print(f"[bold red]❌ Failed to load index/metadata: {e}[/bold red]")
-        return
-    results = search_index(user_query, index, metadata)
-    for i, r in enumerate(results, 1):
-        console.print(f"\n[bold blue]Result {i}[/bold blue]")
-        console.print(f"[bold]File:[/bold] {r['file']}")
-        console.print(f"[italic]{r['content']}[/italic]")
+        console.print(f"[bold red]❌ Failed to load index/metadata/symbol table: {e}[/bold red]")
+        return None, None
 
+    # Search RAG index
+    results = search_index(user_query, index, metadata)
+    combined_code = "\n\n".join(r["content"] for r in results)
+
+    # Query symbol table
+    symbol_results = query_symbol_table(user_query, symbol_table) if symbol_table else []
+    symbol_info = ""
+    for res in symbol_results:
+        if res["type"] == "function":
+            decls = "\n".join(f"- {d['file']} (line {d['line']})" for d in res["declarations"])
+            calls = "\n".join(f"- {c['file']} (line {c['line']})" for c in res["calls"])
+            symbol_info += f"Function '{res['name']}':\n  Declarations:\n{decls}\n  Called in:\n{calls}\n"
+        elif res["type"] == "class":
+            decls = "\n".join(f"- {d['file']} (line {d['line']})" for d in res["declarations"])
+            symbol_info += f"Class '{res['name']}':\n  Declarations:\n{decls}\n"
+        elif res["type"] == "variable":
+            decls = "\n".join(f"- {d['file']} (line {d['line']})" for d in res["declarations"])
+            symbol_info += f"Variable '{res['name']}':\n  Declarations:\n{decls}\n"
+
+    # Combine RAG and symbol table results
+    history_prompt = "\n".join([f"User: {q['question']}\nAssistant: {q['answer']}" for q in chat_history[-MAX_HISTORY:]])
+    prompt = f"{history_prompt}\nUser: {user_query}\nAssistant: Please explain the code and its usage:\n```\n{combined_code}\n```\nSymbol Information:\n{symbol_info}"
+
+    answer = explain_with_mistral(prompt)
+    console.print(Panel.fit(answer, title="💡 Mistral says", style="green"))
+    return results, answer
 
 # === Memory ===
 def load_memory():
@@ -127,7 +165,7 @@ def extract_tags(results):
     return {"files": files, "topic": common.lower()}
 
 def delete_last_codebase():
-    for f in [INDEX_FILE, META_FILE]:
+    for f in [INDEX_FILE, META_FILE, SYMBOL_FILE]:
         if os.path.exists(f):
             os.remove(f)
             console.print(f"❌ Deleted [bold]{f}[/bold]")
@@ -146,12 +184,13 @@ def display_menu():
 # === MAIN LOOP ===
 def main():
     try:
+        global chat_history
         chat_history = load_memory()
         console.print(f"🧠 Loaded [bold]{len(chat_history)}[/bold] previous memory entries.")
 
         index = None
         metadata = None
-        if os.path.exists(INDEX_FILE) and os.path.exists(META_FILE):
+        if os.path.exists(INDEX_FILE) and os.path.exists(META_FILE) and os.path.exists(SYMBOL_FILE):
             index = load_faiss_index()
             metadata = load_metadata()
 
@@ -172,19 +211,13 @@ def main():
                 if query.lower() in ["back", "exit", ""]:
                     continue
 
-                results = search_index(query, index, metadata)
-                combined_code = "\n\n".join(r["content"] for r in results)
-
-                history_prompt = "\n".join([f"User: {q['question']}\nAssistant: {q['answer']}" for q in chat_history[-MAX_HISTORY:]])
-                prompt = f"{history_prompt}\nUser: {query}\nAssistant: Please explain the code:\n```\n{combined_code}\n```"
-
-                answer = explain_with_mistral(prompt)
-                console.print(Panel.fit(answer, title="💡 Mistral says", style="green"))
-
+                results, answer = query_index(query)
+                if results is None and answer is None:
+                    continue
                 chat_history.append({
                     "question": query,
                     "answer": answer,
-                    "tags": extract_tags(results),
+                    "tags": extract_tags(results) if results else {},
                     "timestamp": datetime.datetime.now().isoformat()
                 })
                 save_memory(chat_history)
@@ -216,22 +249,13 @@ def main():
                     console.print("❌ Path does not exist.", style="red")
                     continue
 
-                files = load_cpp_files(folder)
-                model, tokenizer = get_embedding_model()
-                chunks = chunk_code(files, tokenizer, max_tokens=256)
-                
-                try:
-                    embedding_matrix, chunks = embed_chunks(chunks, model, tokenizer)
-                    if embedding_matrix is not None and len(embedding_matrix) > 0:
-                        save_faiss_index(embedding_matrix, chunks)
-                        index = load_faiss_index()
-                        metadata = load_metadata()
-                        console.print("✅ Codebase indexed.", style="green")
-                    else:
-                         console.print("❌ Failed to generate embeddings.", style="red")
-                except Exception as e:
-                    console.print(f"🚨 Error during indexing: {e}", style="bold red")
-                    logging.exception("Indexing error:")
+                success = build_index(folder)
+                if success:
+                    index = load_faiss_index()
+                    metadata = load_metadata()
+                    console.print("✅ Codebase indexed.", style="green")
+                else:
+                    console.print("❌ Indexing failed. Please check the codebase and try again.", style="red")
 
             else:
                 console.print("⚠️ Invalid choice.", style="red")
